@@ -1,13 +1,18 @@
 package ratelimiter
 
 import (
+	"sync"
 	"time"
 )
 
 type FixedWindowRateLimiter struct {
 	requestCount       int
+	permitLimit        int
 	isAutoReplenishing bool
 	window             time.Duration
+	mutex              sync.Mutex
+	idleSince          time.Duration
+	queue              Queue[RequestRegistration]
 }
 
 type FixedWindowRateLimiterOptions struct {
@@ -28,8 +33,10 @@ func NewFixedWindowRateLimiter(options FixedWindowRateLimiterOptions) (*FixedWin
 
 	limiter := FixedWindowRateLimiter{
 		requestCount:       options.PermitLimit,
+		permitLimit:        options.PermitLimit,
 		isAutoReplenishing: options.AutoReplenishment,
 		window:             options.Window,
+		queue:              NewQueue[RequestRegistration](),
 	}
 
 	if options.AutoReplenishment {
@@ -50,12 +57,26 @@ func (f *FixedWindowRateLimiter) Acquire(permitCount int) (RateLimitLease, error
 	}
 
 	// Amount of permits is so high that they can never be acquired
-	if permitCount > f.requestCount {
+	if permitCount > f.permitLimit {
 		return nil, &ArgumentError{Message: "permit count is higher then maximum number of permits available"}
 	}
 
-	//TODO implement me
-	panic("implement me")
+	if permitCount == 0 {
+
+	}
+
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	success, lease, err := f.tryLeaseUnsynchronized(permitCount)
+	if err != nil {
+		return nil, err
+	}
+	if success {
+		return lease, nil
+	}
+
+	return &FixedWindowLease{isAcquired: false}, nil
 }
 
 func (f *FixedWindowRateLimiter) ReplenishmentPeriod() time.Duration {
@@ -67,8 +88,45 @@ func (f *FixedWindowRateLimiter) IsAutoReplenishing() bool {
 }
 
 func (f *FixedWindowRateLimiter) TryReplenish() (bool, error) {
-	//TODO implement me
-	panic("implement me")
+	if f.isAutoReplenishing {
+		return false, nil
+	}
+
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	return false, nil
+}
+
+func (f *FixedWindowRateLimiter) tryLeaseUnsynchronized(requestCount int) (bool, *FixedWindowLease, error) {
+	if f.requestCount >= requestCount && f.requestCount != 0 {
+		// Edge case where the lock show 0 availabe permits
+		if requestCount == 0 {
+			return true, &FixedWindowLease{
+				isAcquired: true,
+				retryAfter: 0,
+			}, nil
+		}
+
+		if f.queue.GetSize() == 0 {
+			f.idleSince = 0
+			f.requestCount -= requestCount
+			return true, &FixedWindowLease{
+				isAcquired: true,
+				retryAfter: 0,
+			}, nil
+		}
+	}
+
+	return false, nil, nil
+}
+
+type RequestRegistration struct {
+	Count int
+}
+
+func NewRequestRegistration(requestCount int) RequestRegistration {
+	return RequestRegistration{Count: requestCount}
 }
 
 // Force FixedWindowRateLimiter to adhere to RateLimiter and ReplenishingRateLimiter interface
